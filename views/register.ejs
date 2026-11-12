@@ -1,0 +1,23 @@
+<%- include('partials/header') %>
+
+<section class="auth-shell">
+  <h1>Criar conta</h1>
+  <form method="POST" action="/register" class="form-grid">
+    <label>
+      Nome completo
+      <input type="text" name="name" required />
+    </label>
+    <label>
+      E-mail
+      <input type="email" name="email" required />
+    </label>
+    <label>
+      Senha
+      <input type="password" name="password" required minlength="10" autocomplete="new-password" />
+    </label>
+    <button type="submit" class="button">Cadastrar</button>
+    <p>Já tem uma conta? <a href="/login">Entrar</a></p>
+  </form>
+</section>
+
+<%- include('partials/footer') %>

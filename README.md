@@ -1,0 +1,113 @@
+# Receitas de Todos
+
+Uma comunidade de culinária para publicar receitas, comentar, avaliar, salvar favoritas e moderar conteúdos.
+
+## Tecnologias
+
+- Node.js
+- Express
+- EJS
+- SQLite
+- Better-SQLite3
+- bcryptjs
+- express-session
+- multer
+
+## Requisitos
+
+- Node.js 18+
+- npm
+
+## Instalação
+
+```bash
+npm install
+npm start
+```
+
+Acesse: http://localhost:3000
+
+## Testes
+
+Execute `npm test` para verificar a sintaxe do app e rodar os testes integrados de cadastro, receitas, upload, comentários, moderação e persistência de sessão.
+
+## Usuário administrador padrão
+
+- E-mail: admin@receitasdetodos.com
+- Senha: admin123
+- Acesse `/admin` após entrar para moderar denúncias e excluir qualquer receita.
+- Essa conta padrão é apenas para desenvolvimento local. Em produção, use `ADMIN_EMAIL` e `ADMIN_PASSWORD`.
+
+## Funcionalidades implementadas
+
+- Home com receitas recentes, populares e em destaque
+- Cadastro e login com autenticação real em servidor
+- Recuperação de senha com link temporário enviado por SMTP
+- Sessões persistidas no SQLite
+- Publicação, edição e exclusão de receitas
+- Curtidas, favoritos e avaliações por estrelas
+- Comentários com respostas e denúncias de receitas/comentários
+- Perfis com edição de nome, biografia e foto
+- Busca por nome, ingrediente, categoria, dificuldade e tempo máximo
+- Painel administrativo para receitas, denúncias e suspensão de contas
+- Prévia da imagem antes de publicar ou atualizar uma receita
+- Painel administrativo com listagem e exclusão de todas as receitas
+- Páginas de Sobre, Contato, Privacidade e Termos
+- PWA instalável e interface adaptada para celular
+- Compartilhamento nativo/link copiável das receitas e metadados SEO por receita
+- Espaços reservados para futuro Google AdSense
+
+## Banco de dados e arquivos
+
+O projeto usa SQLite para armazenar usuários, receitas, comentários, curtidas, avaliações, favoritos, denúncias e sessões.
+Por padrão, o banco fica em `data/recipes.db`. Os uploads ficam em `public/uploads`.
+Use `DATA_DIR` e `UPLOAD_DIR` para apontar para um volume persistente no ambiente de hospedagem.
+
+## Preparar para publicação
+
+O app pode ser hospedado em um serviço que rode Node.js. Antes de publicar, configure estas variáveis no provedor:
+
+```text
+NODE_ENV=production
+SESSION_SECRET=<segredo longo e aleatório>
+ADMIN_EMAIL=<seu e-mail administrativo>
+ADMIN_PASSWORD=<senha forte>
+DATA_DIR=<caminho do volume persistente para o SQLite>
+UPLOAD_DIR=<caminho do volume persistente para as imagens>
+```
+
+`SESSION_SECRET` deve ter ao menos 32 caracteres e `ADMIN_PASSWORD` ao menos 12. O comando de inicialização é `npm start`. Em produção, `DATA_DIR` e `UPLOAD_DIR` são obrigatórios: aponte ambos para armazenamento persistente do provedor. Um exemplo de montagem é `DATA_DIR=/var/data` e `UPLOAD_DIR=/var/data/uploads`. Serviços com disco temporário podem apagar banco e imagens após reinicializações; não publique com armazenamento efêmero.
+
+Para habilitar recuperação por e-mail, configure também:
+
+```text
+SMTP_HOST=<servidor SMTP>
+SMTP_PORT=587
+SMTP_FROM=<remetente verificado>
+SMTP_USER=<usuário SMTP>
+SMTP_PASS=<senha ou chave SMTP>
+APP_BASE_URL=https://seu-dominio.example
+```
+
+Se SMTP não estiver configurado, o formulário informa que a recuperação está indisponível e não revela nem exibe tokens. O banco SQLite, sessões e imagens agora podem persistir em um volume único; para escalar para várias instâncias, migre para PostgreSQL e armazenamento de objetos.
+
+Para instalar no celular, publique o site com HTTPS e use “Adicionar à tela inicial” no navegador. O service worker mantém os recursos estáticos disponíveis em cache; as páginas e dados do usuário precisam de conexão.
+
+As credenciais administrativas por variável de ambiente são aplicadas quando o servidor inicia. Se o e-mail configurado já existir, a senha fornecida passa a ser a senha administrativa desse usuário.
+
+## O que ainda pode ser aprimorado
+
+- Upload de imagens para storage externo (Cloudinary ou Supabase Storage)
+- Configurar SMTP e domínio verificado no provedor de e-mail
+- Migração do SQLite local para banco gerenciado em produção
+- Cache e SEO mais robustos
+- Dashboard analítico para moderadores
+- Integração com Google AdSense e analytics
+
+## Como administrar a comunidade
+
+- Use o login administrativo para acessar o painel `/admin`
+- Revise denúncias abertas e resolva-as
+- Na seção “Controle de receitas”, exclua qualquer receita inadequada
+- Exclusões administrativas também removem as interações associadas à receita
+- As ações de moderação exigem uma sessão autenticada de administrador

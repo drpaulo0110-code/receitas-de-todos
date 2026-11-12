@@ -1,0 +1,83 @@
+<%- include('partials/header') %>
+
+<section class="page-header">
+  <div class="breadcrumbs">Perfil</div>
+  <h1><%= userData.name %></h1>
+</section>
+
+<section class="profile-grid">
+  <aside class="panel">
+    <img class="avatar" src="<%= userData.avatar_url || '/images/default-avatar.svg' %>" alt="Foto de perfil" />
+    <h2><%= userData.name %></h2>
+    <p><%= userData.bio || 'Sem biografia ainda.' %></p>
+    <% if (isOwnProfile) { %>
+      <a href="/profile/edit" class="button-secondary">Editar perfil</a>
+      <a href="/new-recipe" class="button">Nova receita</a>
+    <% } %>
+  </aside>
+
+  <div class="stack">
+    <div class="stats-row">
+      <div class="stat-box">
+        <strong><%= userData.recipes_count || 0 %></strong>
+        receitas
+      </div>
+      <div class="stat-box">
+        <strong><%= userData.total_likes_received || 0 %></strong>
+        curtidas
+      </div>
+      <div class="stat-box">
+        <strong><%= favorites.length || 0 %></strong>
+        favoritos
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Receitas publicadas</h2>
+      <% if (!recipes || recipes.length === 0) { %>
+        <p>Nenhuma receita publicada ainda.</p>
+      <% } else { %>
+        <div class="recipes-grid grid">
+          <% recipes.forEach((recipe) => { %>
+            <article class="recipe-card">
+              <div class="recipe-thumb" style="background-image: url('<%= recipe.photo_url || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=900&q=80' %>');"></div>
+              <div class="recipe-content">
+                <h3><a href="/recipe/<%= recipe.id %>"><%= recipe.title %></a></h3>
+                <div class="meta-row">
+                  <span class="tag"><%= recipe.category %></span>
+                  <span>⭐ <%= Number(recipe.average_rating || 0).toFixed(1) %></span>
+                </div>
+              </div>
+            </article>
+          <% }) %>
+        </div>
+      <% } %>
+    </div>
+
+    <% if (isOwnProfile) { %>
+      <div class="panel">
+        <h2>Receitas favoritas</h2>
+        <% if (!favorites || favorites.length === 0) { %>
+          <p>Você ainda não salvou nenhuma receita como favorita.</p>
+        <% } else { %>
+          <div class="recipes-grid grid">
+            <% favorites.forEach((recipe) => { %>
+              <article class="recipe-card">
+                <div class="recipe-thumb" style="background-image: url('<%= recipe.photo_url || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=900&q=80' %>');"></div>
+                <div class="recipe-content">
+                  <h3><a href="/recipe/<%= recipe.id %>"><%= recipe.title %></a></h3>
+                  <div class="meta-row">
+                    <span class="tag"><%= recipe.category %></span>
+                    <span>❤️ <%= recipe.likes_count || 0 %></span>
+                  </div>
+                </div>
+              </article>
+            <% }) %>
+          </div>
+        <% } %>
+      </div>
+    <% } %>
+  </div>
+</section>
+
+<%- include('partials/footer') %>

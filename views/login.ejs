@@ -1,0 +1,22 @@
+<%- include('partials/header') %>
+
+<section class="auth-shell">
+  <h1>Entrar</h1>
+  <form method="POST" action="/login" class="form-grid">
+    <label>
+      E-mail
+      <input type="email" name="email" required />
+    </label>
+    <label>
+      Senha
+      <input type="password" name="password" required autocomplete="current-password" />
+    </label>
+    <button type="submit" class="button">Acessar conta</button>
+    <div class="meta-row">
+      <a href="/register">Criar conta</a>
+      <a href="/recover">Esqueci a senha</a>
+    </div>
+  </form>
+</section>
+
+<%- include('partials/footer') %>

@@ -1,0 +1,17 @@
+{
+  "name": "Receitas de Todos",
+  "short_name": "Receitas",
+  "description": "Comunidade de culinária para compartilhar receitas e descobrir pratos novos.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#fff8f3",
+  "theme_color": "#cd6d2b",
+  "icons": [
+    {
+      "src": "/images/default-recipe.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}

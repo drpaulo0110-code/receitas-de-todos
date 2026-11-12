@@ -1,0 +1,181 @@
+<%- include('partials/header') %>
+
+<section class="page-header">
+  <div class="breadcrumbs">Receitas / <%= recipe.title %></div>
+  <h1><%= recipe.title %></h1>
+</section>
+
+<section class="recipe-detail stack">
+  <div>
+    <div class="detail-cover" style="background-image: url('<%= recipe.photo_url || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=900&q=80' %>');"></div>
+
+    <div class="sidebar-card" style="margin-top: 20px;">
+      <div class="meta-row">
+        <span class="tag"><%= recipe.category %></span>
+        <span>⭐ <%= Number(recipe.average_rating || 0).toFixed(1) %> (<%= recipe.ratings_count || 0 %>)</span>
+      </div>
+      <p><%= recipe.description %></p>
+
+      <div class="inline-actions">
+        <button type="button" class="button-secondary" data-share-recipe data-share-title="<%= recipe.title %>">Compartilhar</button>
+        <span class="form-hint" data-share-feedback aria-live="polite"></span>
+        <% if (currentUser) { %>
+          <form method="POST" action="/recipe/<%= recipe.id %>/like">
+            <button type="submit" class="button-secondary"><%= hasLiked ? 'Descurtir' : 'Curtir' %></button>
+          </form>
+          <form method="POST" action="/recipe/<%= recipe.id %>/favorite">
+            <button type="submit" class="button-secondary"><%= hasFavorited ? 'Remover favorito' : 'Salvar nos favoritos' %></button>
+          </form>
+        <% } else { %>
+          <a href="/login" class="button-secondary">Curtir</a>
+          <a href="/login" class="button-secondary">Favoritar</a>
+        <% } %>
+        <% if (isOwner || (currentUser && currentUser.is_admin)) { %>
+          <a href="/recipe/<%= recipe.id %>/edit" class="button-secondary">Editar</a>
+          <form method="POST" action="/recipe/<%= recipe.id %>/delete">
+            <button type="submit" class="button-secondary">Excluir</button>
+          </form>
+        <% } %>
+      </div>
+    </div>
+  </div>
+
+  <aside class="stack">
+    <div class="sidebar-card">
+      <h3>Detalhes</h3>
+      <div class="meta-row"><strong>Autor:</strong> <a href="/profile/<%= recipe.user_id %>"><%= recipe.author_name %></a></div>
+      <div class="meta-row"><strong>Tempo:</strong> <span><%= recipe.prep_time %></span></div>
+      <div class="meta-row"><strong>Rendimento:</strong> <span><%= recipe.servings %></span></div>
+      <div class="meta-row"><strong>Dificuldade:</strong> <span><%= recipe.difficulty %></span></div>
+      <div class="meta-row"><strong>Curtidas:</strong> <span><%= recipe.likes_count || 0 %></span></div>
+      <div class="meta-row"><strong>Comentários:</strong> <span><%= recipe.comments_count || 0 %></span></div>
+    </div>
+
+    <% if (currentUser) { %>
+      <div class="sidebar-card">
+        <h3>Avalie esta receita</h3>
+        <form method="POST" action="/recipe/<%= recipe.id %>/rate">
+          <label>
+            Sua nota
+            <select name="score">
+              <option value="1" <%= userRating === 1 ? 'selected' : '' %>>1 estrela</option>
+              <option value="2" <%= userRating === 2 ? 'selected' : '' %>>2 estrelas</option>
+              <option value="3" <%= userRating === 3 ? 'selected' : '' %>>3 estrelas</option>
+              <option value="4" <%= userRating === 4 ? 'selected' : '' %>>4 estrelas</option>
+              <option value="5" <%= userRating === 5 ? 'selected' : '' %>>5 estrelas</option>
+            </select>
+          </label>
+          <button type="submit" class="button" style="margin-top: 10px;">Enviar avaliação</button>
+        </form>
+      </div>
+    <% } %>
+
+    <% if (currentUser) { %>
+      <div class="sidebar-card">
+        <h3>Denunciar</h3>
+        <form method="POST" action="/recipe/<%= recipe.id %>/report">
+          <label>
+            Motivo
+            <textarea name="reason" maxlength="500" required placeholder="Explique o motivo da denúncia"></textarea>
+          </label>
+          <button type="submit" class="button-secondary" style="margin-top: 10px;">Enviar denúncia</button>
+        </form>
+      </div>
+    <% } %>
+  </aside>
+</section>
+
+<section class="section">
+  <div class="panel">
+    <h2>Ingredientes</h2>
+    <ul>
+      <% ingredients.forEach((item) => { %>
+        <li><%= item %></li>
+      <% }) %>
+    </ul>
+  </div>
+</section>
+
+<section class="section">
+  <div class="panel">
+    <h2>Modo de preparo</h2>
+    <ol>
+      <% steps.forEach((step) => { %>
+        <li><%= step %></li>
+      <% }) %>
+    </ol>
+  </div>
+</section>
+
+<section class="section">
+  <div class="panel">
+    <h2>Comentários</h2>
+    <% if (currentUser) { %>
+      <form method="POST" action="/recipe/<%= recipe.id %>/comment" class="form-grid" style="margin-bottom: 18px;">
+        <textarea name="body" maxlength="1000" required placeholder="Deixe uma dica ou comentário..."></textarea>
+        <button type="submit" class="button">Publicar comentário</button>
+      </form>
+    <% } else { %>
+      <p><a href="/login">Faça login</a> para comentar nesta receita.</p>
+    <% } %>
+
+    <div class="comment-list">
+      <% if (!comments || comments.length === 0) { %>
+        <p>Seja o primeiro(a) a comentar.</p>
+      <% } else { %>
+        <% comments.forEach((comment) => { %>
+          <div class="comment-box">
+            <small><strong><%= comment.author_name %></strong> • <%= formatDate(comment.created_at) %></small>
+            <div><%= comment.body %></div>
+            <% if (currentUser) { %>
+              <div class="inline-actions comment-actions">
+                <details>
+                  <summary>Responder</summary>
+                  <form method="POST" action="/recipe/<%= recipe.id %>/comment" class="form-grid">
+                    <input type="hidden" name="parent_id" value="<%= comment.id %>" />
+                    <textarea name="body" maxlength="1000" required placeholder="Escreva sua resposta..."></textarea>
+                    <button type="submit" class="button-secondary">Enviar resposta</button>
+                  </form>
+                </details>
+                <details>
+                  <summary>Denunciar</summary>
+                  <form method="POST" action="/comment/<%= comment.id %>/report" class="form-grid">
+                    <textarea name="reason" maxlength="500" required placeholder="Motivo da denúncia"></textarea>
+                    <button type="submit" class="button-secondary">Enviar denúncia</button>
+                  </form>
+                </details>
+              </div>
+            <% } %>
+            <% if (currentUser && currentUser.is_admin) { %>
+              <form method="POST" action="/admin/comment/<%= comment.id %>/delete" style="margin-top: 10px;" data-confirm-delete="Excluir este comentário e as respostas relacionadas?">
+                <button type="submit" class="button-secondary">Remover comentário</button>
+              </form>
+            <% } %>
+            <% comment.replies.forEach((reply) => { %>
+              <div class="comment-box comment-reply">
+                <small><strong><%= reply.author_name %></strong> respondeu • <%= formatDate(reply.created_at) %></small>
+                <div><%= reply.body %></div>
+                <% if (currentUser) { %>
+                  <details>
+                    <summary>Denunciar resposta</summary>
+                    <form method="POST" action="/comment/<%= reply.id %>/report" class="form-grid">
+                      <textarea name="reason" maxlength="500" required placeholder="Motivo da denúncia"></textarea>
+                      <button type="submit" class="button-secondary">Enviar denúncia</button>
+                    </form>
+                  </details>
+                <% } %>
+                <% if (currentUser && currentUser.is_admin) { %>
+                  <form method="POST" action="/admin/comment/<%= reply.id %>/delete" style="margin-top: 10px;">
+                    <button type="submit" class="button-secondary">Remover resposta</button>
+                  </form>
+                <% } %>
+              </div>
+            <% }) %>
+          </div>
+        <% }) %>
+      <% } %>
+    </div>
+  </div>
+</section>
+
+<%- include('partials/footer') %>

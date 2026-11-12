@@ -1,0 +1,92 @@
+<%- include('partials/header') %>
+
+<section class="page-header">
+  <div class="breadcrumbs">Início / Receitas</div>
+  <h1>Explorar receitas</h1>
+</section>
+
+<section class="panel">
+  <form method="GET" action="/recipes" class="form-grid">
+    <div class="form-row">
+      <label>
+        Busca por nome ou ingrediente
+        <input type="text" name="q" value="<%= search %>" placeholder="Ex.: bolo, limão, massa, salada" />
+      </label>
+      <label>
+        Categoria
+        <select name="category">
+          <option value="">Todas</option>
+          <% categories.forEach((category) => { %>
+            <option value="<%= category %>" <%= category === selectedCategory ? 'selected' : '' %>><%= category %></option>
+          <% }) %>
+        </select>
+      </label>
+    </div>
+
+    <div class="form-row">
+      <label>
+        Dificuldade
+        <select name="difficulty">
+          <option value="">Qualquer</option>
+          <option value="fácil" <%= difficulty === 'fácil' ? 'selected' : '' %>>Fácil</option>
+          <option value="média" <%= difficulty === 'média' ? 'selected' : '' %>>Média</option>
+          <option value="difícil" <%= difficulty === 'difícil' ? 'selected' : '' %>>Difícil</option>
+        </select>
+      </label>
+      <label>
+        Ordenar por
+        <select name="sort">
+          <option value="newest" <%= sort === 'newest' ? 'selected' : '' %>>Mais recentes</option>
+          <option value="popular" <%= sort === 'popular' ? 'selected' : '' %>>Mais populares</option>
+          <option value="rating" <%= sort === 'rating' ? 'selected' : '' %>>Melhores avaliadas</option>
+          <option value="oldest" <%= sort === 'oldest' ? 'selected' : '' %>>Mais antigas</option>
+        </select>
+      </label>
+    </div>
+
+    <label>
+      Tempo máximo de preparo
+      <select name="max_time">
+        <option value="">Qualquer tempo</option>
+        <% [15, 30, 45, 60, 90, 120].forEach((minutes) => { %>
+          <option value="<%= minutes %>" <%= maxPrepTime === minutes ? 'selected' : '' %>>Até <%= minutes %> minutos</option>
+        <% }) %>
+      </select>
+    </label>
+
+    <div class="inline-actions">
+      <button type="submit" class="button">Filtrar receitas</button>
+      <a href="/recipes" class="button-secondary">Limpar</a>
+    </div>
+  </form>
+</section>
+
+<section class="section">
+  <div class="recipes-grid grid">
+    <% if (!recipes || recipes.length === 0) { %>
+      <div class="panel">
+        <p>Nenhuma receita encontrada com os filtros atuais. Tente outra busca ou publique uma nova receita.</p>
+      </div>
+    <% } else { %>
+      <% recipes.forEach((recipe) => { %>
+        <article class="recipe-card">
+          <div class="recipe-thumb" style="background-image: url('<%= recipe.photo_url || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=900&q=80' %>');"></div>
+          <div class="recipe-content">
+            <div class="meta-row">
+              <span class="tag"><%= recipe.category %></span>
+              <span>⭐ <%= Number(recipe.average_rating || 0).toFixed(1) %></span>
+            </div>
+            <h3><a href="/recipe/<%= recipe.id %>"><%= recipe.title %></a></h3>
+            <p><%= recipe.description.slice(0, 110) %><%= recipe.description.length > 110 ? '...' : '' %></p>
+            <div class="recipe-actions">
+              <span>❤️ <%= recipe.likes_count || 0 %></span>
+              <a href="/recipe/<%= recipe.id %>" class="button-secondary">Abrir</a>
+            </div>
+          </div>
+        </article>
+      <% }) %>
+    <% } %>
+  </div>
+</section>
+
+<%- include('partials/footer') %>

@@ -1,0 +1,130 @@
+<%- include('partials/header') %>
+
+<section class="hero">
+  <div class="hero-card">
+    <div>
+      <span class="tag">Comunidade gastronômica</span>
+      <h1>Descubra receitas que fazem a casa inteira sorrir.</h1>
+      <p>
+        Compartilhe pratos incríveis, descubra novas combinações e conecte-se com pessoas apaixonadas por cozinhar.
+      </p>
+
+      <div class="hero-actions">
+        <a href="/recipes" class="button">Explorar receitas</a>
+        <a href="/new-recipe" class="button-secondary">Publicar receita</a>
+      </div>
+
+      <div class="category-strip">
+        <% categories.forEach((category) => { %>
+          <a href="/recipes?category=<%= encodeURIComponent(category) %>" class="category-pill"><%= category %></a>
+        <% }) %>
+      </div>
+    </div>
+
+    <div class="hero-image" aria-label="Imagem de prato delicioso"></div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-head">
+    <h2>Receitas em destaque</h2>
+    <a href="/recipes" class="button-secondary">Ver todas</a>
+  </div>
+
+  <div class="recipes-grid grid">
+    <% featuredRecipes.forEach((recipe) => { %>
+      <article class="recipe-card">
+        <div class="recipe-thumb" style="background-image: url('<%= recipe.photo_url || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=900&q=80' %>');"></div>
+        <div class="recipe-content">
+          <div class="meta-row">
+            <span class="tag"><%= recipe.category %></span>
+            <span>⭐ <%= Number(recipe.average_rating || 0).toFixed(1) %></span>
+          </div>
+          <h3><a href="/recipe/<%= recipe.id %>"><%= recipe.title %></a></h3>
+          <p><%= recipe.description.slice(0, 90) %><%= recipe.description.length > 90 ? '...' : '' %></p>
+          <div class="recipe-actions">
+            <span><%= recipe.likes_count || 0 %> curtidas</span>
+            <a href="/recipe/<%= recipe.id %>" class="button-secondary">Ver receita</a>
+          </div>
+        </div>
+      </article>
+    <% }) %>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-head">
+    <h2>Receitas recentes</h2>
+    <a href="/recipes?sort=newest" class="button-secondary">Mais recentes</a>
+  </div>
+
+  <div class="recipes-grid grid">
+    <% recentRecipes.forEach((recipe) => { %>
+      <article class="recipe-card">
+        <div class="recipe-thumb" style="background-image: url('<%= recipe.photo_url || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=900&q=80' %>');"></div>
+        <div class="recipe-content">
+          <div class="meta-row">
+            <span class="tag"><%= recipe.category %></span>
+            <span><%= formatDate(recipe.created_at) %></span>
+          </div>
+          <h3><a href="/recipe/<%= recipe.id %>"><%= recipe.title %></a></h3>
+          <p><%= recipe.description.slice(0, 88) %><%= recipe.description.length > 88 ? '...' : '' %></p>
+          <div class="recipe-actions">
+            <span>⏱ <%= recipe.prep_time %></span>
+            <a href="/recipe/<%= recipe.id %>" class="button-secondary">Abrir</a>
+          </div>
+        </div>
+      </article>
+    <% }) %>
+  </div>
+</section>
+
+<section class="section">
+  <div class="section-head">
+    <h2>Mais populares</h2>
+    <a href="/recipes?sort=popular" class="button-secondary">Ver ranking</a>
+  </div>
+
+  <div class="recipes-grid grid">
+    <% popularRecipes.forEach((recipe) => { %>
+      <article class="recipe-card">
+        <div class="recipe-thumb" style="background-image: url('<%= recipe.photo_url || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=900&q=80' %>');"></div>
+        <div class="recipe-content">
+          <div class="meta-row">
+            <span class="tag"><%= recipe.category %></span>
+            <span>❤️ <%= recipe.likes_count || 0 %></span>
+          </div>
+          <h3><a href="/recipe/<%= recipe.id %>"><%= recipe.title %></a></h3>
+          <p><%= recipe.description.slice(0, 90) %><%= recipe.description.length > 90 ? '...' : '' %></p>
+          <div class="recipe-actions">
+            <span>⭐ <%= Number(recipe.average_rating || 0).toFixed(1) %></span>
+            <a href="/recipe/<%= recipe.id %>" class="button-secondary">Detalhes</a>
+          </div>
+        </div>
+      </article>
+    <% }) %>
+  </div>
+</section>
+
+<section class="section">
+  <div class="feature-list">
+    <div class="feature-card">
+      <h3>📚 Receitas confiáveis</h3>
+      <p>Conteúdos organizados com ingredientes, passos e tempo de preparo claros.</p>
+    </div>
+    <div class="feature-card">
+      <h3>👨‍🍳 Comunidade ativa</h3>
+      <p>Curta, comente e avalie receitas para ajudar outros usuários a descobrir novos sabores.</p>
+    </div>
+    <div class="feature-card">
+      <h3>📈 Preparado para monetização</h3>
+      <p>Estrutura de páginas e layout para futuro uso com Google AdSense e SEO.</p>
+    </div>
+  </div>
+</section>
+
+<div class="section">
+  <div class="ad-card">Espaço para anúncio / Google AdSense</div>
+</div>
+
+<%- include('partials/footer') %>

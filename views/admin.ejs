@@ -1,0 +1,102 @@
+<%- include('partials/header') %>
+
+<section class="page-header">
+  <div class="breadcrumbs">Administração</div>
+  <h1>Painel de moderação</h1>
+</section>
+
+<section class="admin-stats">
+  <div class="stat-box"><strong><%= stats.users %></strong> usuários</div>
+  <div class="stat-box"><strong><%= stats.recipes %></strong> receitas</div>
+  <div class="stat-box"><strong><%= stats.comments %></strong> comentários</div>
+  <div class="stat-box"><strong><%= stats.reports %></strong> denúncias abertas</div>
+</section>
+
+<section class="section">
+  <div class="panel">
+    <h2>Contas da comunidade</h2>
+    <p>Suspender uma conta impede novos acessos e encerra as sessões ativas. As receitas existentes permanecem publicadas até serem moderadas separadamente.</p>
+    <% if (!users || users.length === 0) { %>
+      <p>Não há contas de usuários para moderar.</p>
+    <% } else { %>
+      <div class="admin-recipe-list">
+        <% users.forEach((user) => { %>
+          <article class="admin-recipe-row">
+            <img src="/images/default-avatar.svg" alt="" />
+            <div class="admin-recipe-info">
+              <strong><%= user.name %></strong>
+              <span><%= user.email %> · <%= user.recipes_count %> receitas · <%= user.is_suspended ? 'Suspensa' : 'Ativa' %></span>
+            </div>
+            <form method="POST" action="/admin/user/<%= user.id %>/toggle-suspension" data-confirm-delete="<%= user.is_suspended ? 'Reativar esta conta?' : 'Suspender esta conta e encerrar as sessões?' %>">
+              <button type="submit" class="button-secondary"><%= user.is_suspended ? 'Reativar conta' : 'Suspender conta' %></button>
+            </form>
+          </article>
+        <% }) %>
+      </div>
+    <% } %>
+  </div>
+</section>
+
+<section class="section">
+  <div class="panel">
+    <div class="section-head">
+      <div>
+        <h2>Controle de receitas</h2>
+        <p>Você pode remover qualquer publicação da comunidade. A ação também apaga curtidas, favoritos, avaliações e comentários ligados à receita.</p>
+      </div>
+    </div>
+    <% if (!recipes || recipes.length === 0) { %>
+      <p>Ainda não há receitas publicadas.</p>
+    <% } else { %>
+      <div class="admin-recipe-list">
+        <% recipes.forEach((recipe) => { %>
+          <article class="admin-recipe-row">
+            <img src="<%= recipe.photo_url || '/images/default-recipe.svg' %>" alt="" loading="lazy" />
+            <div class="admin-recipe-info">
+              <a href="/recipe/<%= recipe.id %>"><strong><%= recipe.title %></strong></a>
+              <span><%= recipe.category %> · por <%= recipe.author_name %> · <%= formatDate(recipe.created_at) %></span>
+            </div>
+            <form method="POST" action="/admin/recipe/<%= recipe.id %>/delete" data-confirm-delete="Excluir esta receita e todas as interações relacionadas?">
+              <button type="submit" class="button-danger">Excluir receita</button>
+            </form>
+          </article>
+        <% }) %>
+      </div>
+    <% } %>
+  </div>
+</section>
+
+<section class="section">
+  <div class="panel">
+    <h2>Denúncias</h2>
+    <% if (!reports || reports.length === 0) { %>
+      <p>Não há denúncias pendentes.</p>
+    <% } else { %>
+      <div class="table-like">
+        <% reports.forEach((report) => { %>
+          <div class="comment-box">
+            <strong><%= report.type %></strong>: <%= report.item_label %><br />
+            <small>Relatado por <%= report.reporter_name %> em <%= formatDate(report.created_at) %></small>
+            <p><%= report.reason %></p>
+            <div class="inline-actions">
+              <form method="POST" action="/admin/resolve/<%= report.id %>">
+                <button type="submit" class="button-secondary">Resolver</button>
+              </form>
+              <% if (report.type === 'recipe') { %>
+                <form method="POST" action="/admin/recipe/<%= report.item_id %>/delete">
+                  <button type="submit" class="button-secondary">Remover receita</button>
+                </form>
+              <% } else { %>
+                <form method="POST" action="/admin/comment/<%= report.item_id %>/delete">
+                  <button type="submit" class="button-secondary">Remover comentário</button>
+                </form>
+              <% } %>
+            </div>
+          </div>
+        <% }) %>
+      </div>
+    <% } %>
+  </div>
+</section>
+
+<%- include('partials/footer') %>

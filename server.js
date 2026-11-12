@@ -1,0 +1,1271 @@
+const express = require('express');
+const path = require('path');
+const fs = require('fs');
+const crypto = require('crypto');
+const bcrypt = require('bcryptjs');
+const session = require('express-session');
+const multer = require('multer');
+const nodemailer = require('nodemailer');
+const Database = require('better-sqlite3');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const isProduction = process.env.NODE_ENV === 'production';
+const dataDir = path.resolve(process.env.DATA_DIR || path.join(__dirname, 'data'));
+const uploadDir = path.resolve(process.env.UPLOAD_DIR || path.join(__dirname, 'public', 'uploads'));
+const dbPath = path.join(dataDir, 'recipes.db');
+const IMAGE_TYPES = {
+  'image/jpeg': { extension: '.jpg', signature: (header) => header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff },
+  'image/png': { extension: '.png', signature: (header) => header.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) },
+  'image/webp': { extension: '.webp', signature: (header) => header.toString('ascii', 0, 4) === 'RIFF' && header.toString('ascii', 8, 12) === 'WEBP' },
+  'image/gif': { extension: '.gif', signature: (header) => ['GIF87a', 'GIF89a'].includes(header.toString('ascii', 0, 6)) }
+};
+
+fs.mkdirSync(uploadDir, { recursive: true });
+fs.mkdirSync(dataDir, { recursive: true });
+
+if (isProduction && (!process.env.SESSION_SECRET || !process.env.ADMIN_EMAIL || !process.env.ADMIN_PASSWORD || !process.env.DATA_DIR || !process.env.UPLOAD_DIR)) {
+  throw new Error('Em produção, configure SESSION_SECRET, ADMIN_EMAIL, ADMIN_PASSWORD, DATA_DIR e UPLOAD_DIR.');
+}
+if (isProduction && (process.env.SESSION_SECRET.length < 32 || process.env.ADMIN_PASSWORD.length < 12)) {
+  throw new Error('Em produção, SESSION_SECRET deve ter pelo menos 32 caracteres e ADMIN_PASSWORD pelo menos 12.');
+}
+
+const smtpHost = process.env.SMTP_HOST;
+const smtpFrom = process.env.SMTP_FROM;
+const smtpUser = process.env.SMTP_USER;
+const smtpPass = process.env.SMTP_PASS;
+const smtpPort = Number(process.env.SMTP_PORT || 587);
+if ((smtpHost || smtpFrom || smtpUser || smtpPass || process.env.SMTP_PORT) &&
+    (!smtpHost || !smtpFrom || !Number.isInteger(smtpPort) || smtpPort < 1 || smtpPort > 65535 || Boolean(smtpUser) !== Boolean(smtpPass))) {
+  throw new Error('A configuração SMTP está incompleta ou inválida. Configure host, remetente, porta e usuário/senha em conjunto.');
+}
+if (isProduction && smtpHost && !process.env.APP_BASE_URL) {
+  throw new Error('Configure APP_BASE_URL em produção para gerar links seguros de recuperação de senha.');
+}
+if (isProduction && process.env.APP_BASE_URL) {
+  let baseUrl;
+  try {
+    baseUrl = new URL(process.env.APP_BASE_URL);
+  } catch (_error) {
+    throw new Error('APP_BASE_URL deve ser uma URL válida com HTTPS.');
+  }
+  if (baseUrl.protocol !== 'https:') throw new Error('APP_BASE_URL deve usar HTTPS em produção.');
+}
+
+const mailer = smtpHost
+  ? nodemailer.createTransport({
+      host: smtpHost,
+      port: smtpPort,
+      secure: smtpPort === 465,
+      ...(smtpUser ? { auth: { user: smtpUser, pass: smtpPass } } : {})
+    })
+  : null;
+
+const db = new Database(dbPath);
+const storage = multer.diskStorage({
+  destination: function (_req, _file, cb) {
+    cb(null, uploadDir);
+  },
+  filename: function (_req, file, cb) {
+    const ext = IMAGE_TYPES[file.mimetype]?.extension || '.img';
+    const unique = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+    cb(null, unique);
+  },
+});
+const upload = multer({
+  storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024
+  },
+  fileFilter: (_req, file, cb) => {
+    if (IMAGE_TYPES[file.mimetype]) {
+      cb(null, true);
+      return;
+    }
+    cb(new Error('Formato de imagem não suportado. Envie JPG, PNG, WEBP ou GIF.'));
+  }
+});
+
+function verifyUploadedImage(req, _res, next) {
+  if (!req.file) return next();
+
+  const imageType = IMAGE_TYPES[req.file.mimetype];
+  const descriptor = fs.openSync(req.file.path, 'r');
+  const header = Buffer.alloc(12);
+  try {
+    fs.readSync(descriptor, header, 0, header.length, 0);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+
+  if (!imageType || !imageType.signature(header)) {
+    fs.unlinkSync(req.file.path);
+    return next(new Error('O arquivo enviado não parece ser uma imagem válida.'));
+  }
+
+  next();
+}
+
+class SqliteSessionStore extends session.Store {
+  constructor(database) {
+    super();
+    this.database = database;
+    this.getSession = database.prepare('SELECT sess, expires FROM web_sessions WHERE sid = ?');
+    this.saveSession = database.prepare('INSERT INTO web_sessions (sid, sess, expires, user_id) VALUES (?, ?, ?, ?) ON CONFLICT(sid) DO UPDATE SET sess = excluded.sess, expires = excluded.expires, user_id = excluded.user_id');
+    this.deleteSession = database.prepare('DELETE FROM web_sessions WHERE sid = ?');
+    this.updateExpiry = database.prepare('UPDATE web_sessions SET sess = ?, expires = ?, user_id = ? WHERE sid = ?');
+    this.deleteExpired = database.prepare('DELETE FROM web_sessions WHERE expires <= ?');
+    this.deleteUserSessions = database.prepare('DELETE FROM web_sessions WHERE user_id = ?');
+  }
+
+  get(sid, callback) {
+    try {
+      const row = this.getSession.get(sid);
+      if (!row) return callback(null, null);
+      if (row.expires <= Date.now()) {
+        this.deleteSession.run(sid);
+        return callback(null, null);
+      }
+      return callback(null, JSON.parse(row.sess));
+    } catch (error) {
+      return callback(error);
+    }
+  }
+
+  set(sid, value, callback) {
+    let error = null;
+    try {
+      const expires = value.cookie && value.cookie.expires
+        ? new Date(value.cookie.expires).getTime()
+        : Date.now() + 8 * 60 * 60 * 1000;
+      this.saveSession.run(sid, JSON.stringify(value), expires, value.user ? value.user.id : null);
+    } catch (storeError) {
+      error = storeError;
+    }
+    if (callback) callback(error);
+  }
+
+  touch(sid, value, callback) {
+    let error = null;
+    try {
+      const expires = value.cookie && value.cookie.expires
+        ? new Date(value.cookie.expires).getTime()
+        : Date.now() + 8 * 60 * 60 * 1000;
+      this.updateExpiry.run(JSON.stringify(value), expires, value.user ? value.user.id : null, sid);
+    } catch (storeError) {
+      error = storeError;
+    }
+    if (callback) callback(error);
+  }
+
+  destroy(sid, callback) {
+    let error = null;
+    try {
+      this.deleteSession.run(sid);
+    } catch (storeError) {
+      error = storeError;
+    }
+    if (callback) callback(error);
+  }
+}
+
+const CATEGORIES = ['bolos', 'sobremesas', 'carnes', 'massas', 'bebidas', 'lanches', 'saladas', 'regionais'];
+
+function safeJsonArray(value) {
+  try {
+    const parsed = JSON.parse(value || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (_error) {
+    return [];
+  }
+}
+
+function formatDate(value) {
+  if (!value) return 'Sem data';
+  return new Date(value).toLocaleDateString('pt-BR', { day: '2-digit', month: 'short', year: 'numeric' });
+}
+
+function setFlash(req, message, type = 'info') {
+  req.session.flash = { message, type };
+}
+
+function parseLines(value) {
+  return (value || '')
+    .split(/\n|\r\n/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function getPrepTimeMinutes(value) {
+  const match = String(value || '').match(/^\s*(\d+)/);
+  return match ? Number(match[1]) : 0;
+}
+
+function isSafeImageUrl(value) {
+  if (!value) return true;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' || url.protocol === 'http:';
+  } catch (_error) {
+    return false;
+  }
+}
+
+function parseRecipeForm(body) {
+  const title = (body.title || '').trim();
+  const description = (body.description || '').trim();
+  const category = (body.category || '').trim();
+  const prepMinutes = Number(body.prep_time);
+  const servings = (body.servings || '').trim();
+  const difficulty = (body.difficulty || '').trim();
+  const ingredients = parseLines(body.ingredients);
+  const steps = parseLines(body.steps);
+  const photoUrl = (body.photo_url || '').trim();
+
+  if (title.length < 2 || title.length > 120 ||
+      description.length < 10 || description.length > 3000 ||
+      !CATEGORIES.includes(category) ||
+      !Number.isInteger(prepMinutes) || prepMinutes < 1 || prepMinutes > 1440 ||
+      !servings || servings.length > 80 ||
+      !['fácil', 'média', 'difícil'].includes(difficulty) ||
+      !ingredients.length || ingredients.length > 60 ||
+      ingredients.some((item) => item.length > 200) ||
+      !steps.length || steps.length > 60 ||
+      steps.some((item) => item.length > 1200) ||
+      photoUrl.length > 2000 || !isSafeImageUrl(photoUrl)) {
+    return { error: 'Confira os dados: categoria, dificuldade, tempo, foto e campos de texto precisam ser válidos.' };
+  }
+
+  return {
+    value: {
+      title,
+      description,
+      category,
+      prepTime: `${prepMinutes} minutos`,
+      servings,
+      difficulty,
+      ingredients: JSON.stringify(ingredients),
+      steps: JSON.stringify(steps),
+      photoUrl
+    }
+  };
+}
+
+function getRecipeSummary(params = {}) {
+  const { search = '', category = '', difficulty = '', maxPrepTime = 0, sort = 'newest', limit = 12 } = params;
+  const clauses = ['1 = 1'];
+  const values = [];
+
+  if (search) {
+    const term = `%${search.toLowerCase()}%`;
+    clauses.push('(' +
+      'LOWER(r.title) LIKE ? OR ' +
+      'LOWER(r.description) LIKE ? OR ' +
+      'LOWER(r.ingredients_json) LIKE ? OR ' +
+      'LOWER(r.category) LIKE ?' +
+      ')');
+    values.push(term, term, term, term);
+  }
+
+  if (category) {
+    clauses.push('r.category = ?');
+    values.push(category);
+  }
+
+  if (difficulty) {
+    clauses.push('r.difficulty = ?');
+    values.push(difficulty);
+  }
+
+  if (maxPrepTime) {
+    clauses.push('CAST(r.prep_time AS INTEGER) <= ?');
+    values.push(maxPrepTime);
+  }
+
+  let orderBy = 'r.created_at DESC';
+  if (sort === 'popular') orderBy = 'likes_count DESC, average_rating DESC';
+  if (sort === 'rating') orderBy = 'average_rating DESC, likes_count DESC';
+  if (sort === 'oldest') orderBy = 'r.created_at ASC';
+
+  const sql = `
+    SELECT
+      r.*,
+      u.name AS author_name,
+      u.avatar_url AS author_avatar,
+      (SELECT COUNT(*) FROM likes WHERE recipe_id = r.id) AS likes_count,
+      (SELECT COUNT(*) FROM comments WHERE recipe_id = r.id) AS comments_count,
+      COALESCE((SELECT AVG(score) FROM ratings WHERE recipe_id = r.id), 0) AS average_rating,
+      (SELECT COUNT(*) FROM favorites WHERE recipe_id = r.id) AS favorites_count
+    FROM recipes r
+    JOIN users u ON u.id = r.user_id
+    WHERE ${clauses.join(' AND ')}
+    ORDER BY ${orderBy}
+    LIMIT ?
+  `;
+
+  return db.prepare(sql).all(...values, limit);
+}
+
+function getRecipeDetail(id) {
+  return db.prepare(`
+    SELECT
+      r.*,
+      u.name AS author_name,
+      u.email AS author_email,
+      u.bio AS author_bio,
+      u.avatar_url AS author_avatar,
+      (SELECT COUNT(*) FROM likes WHERE recipe_id = r.id) AS likes_count,
+      (SELECT COUNT(*) FROM comments WHERE recipe_id = r.id) AS comments_count,
+      COALESCE((SELECT AVG(score) FROM ratings WHERE recipe_id = r.id), 0) AS average_rating,
+      (SELECT COUNT(*) FROM ratings WHERE recipe_id = r.id) AS ratings_count,
+      (SELECT COUNT(*) FROM favorites WHERE recipe_id = r.id) AS favorites_count
+    FROM recipes r
+    JOIN users u ON u.id = r.user_id
+    WHERE r.id = ?
+  `).get(id);
+}
+
+function removeRecipe(recipeId) {
+  const recipe = db.prepare('SELECT id, photo_url FROM recipes WHERE id = ?').get(recipeId);
+  if (!recipe) return false;
+
+  db.transaction(() => {
+    db.prepare("DELETE FROM reports WHERE type = 'comment' AND item_id IN (SELECT id FROM comments WHERE recipe_id = ?)").run(recipeId);
+    db.prepare("DELETE FROM reports WHERE type = 'recipe' AND item_id = ?").run(recipeId);
+    db.prepare('DELETE FROM likes WHERE recipe_id = ?').run(recipeId);
+    db.prepare('DELETE FROM favorites WHERE recipe_id = ?').run(recipeId);
+    db.prepare('DELETE FROM ratings WHERE recipe_id = ?').run(recipeId);
+    db.prepare('DELETE FROM comments WHERE recipe_id = ?').run(recipeId);
+    db.prepare('DELETE FROM recipes WHERE id = ?').run(recipeId);
+  })();
+
+  if (recipe.photo_url && recipe.photo_url.startsWith('/uploads/')) {
+    const filename = recipe.photo_url.slice('/uploads/'.length);
+    if (filename && filename === path.basename(filename)) {
+      const imagePath = path.join(uploadDir, filename);
+      if (fs.existsSync(imagePath)) fs.unlinkSync(imagePath);
+    }
+  }
+  return true;
+}
+
+function getUserSummary(userId) {
+  return db.prepare(`
+    SELECT u.*,
+      (SELECT COUNT(*) FROM recipes WHERE user_id = u.id) AS recipes_count,
+      (SELECT COUNT(*) FROM likes l JOIN recipes r ON r.id = l.recipe_id WHERE r.user_id = u.id) AS total_likes_received,
+      (SELECT COUNT(*) FROM favorites f JOIN recipes r ON r.id = f.recipe_id WHERE r.user_id = u.id) AS total_favorites_received
+    FROM users u
+    WHERE u.id = ?
+  `).get(userId);
+}
+
+function initializeDatabase() {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL,
+      email TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      bio TEXT DEFAULT '',
+      avatar_url TEXT DEFAULT '',
+      is_admin INTEGER DEFAULT 0,
+      is_suspended INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS recipes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      category TEXT NOT NULL,
+      description TEXT NOT NULL,
+      photo_url TEXT DEFAULT '',
+      ingredients_json TEXT NOT NULL,
+      steps_json TEXT NOT NULL,
+      prep_time TEXT NOT NULL,
+      servings TEXT NOT NULL,
+      difficulty TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS likes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      recipe_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(recipe_id, user_id),
+      FOREIGN KEY (recipe_id) REFERENCES recipes(id),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS favorites (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      recipe_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(recipe_id, user_id),
+      FOREIGN KEY (recipe_id) REFERENCES recipes(id),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ratings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      recipe_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      score INTEGER NOT NULL CHECK(score >=1 AND score <= 5),
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(recipe_id, user_id),
+      FOREIGN KEY (recipe_id) REFERENCES recipes(id),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS comments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      recipe_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      parent_id INTEGER DEFAULT NULL,
+      body TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (recipe_id) REFERENCES recipes(id),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS reports (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      type TEXT NOT NULL,
+      item_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      status TEXT DEFAULT 'open',
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS password_resets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      token TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(token),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS web_sessions (
+      sid TEXT PRIMARY KEY,
+      sess TEXT NOT NULL,
+      expires INTEGER NOT NULL,
+      user_id INTEGER
+    );
+    CREATE INDEX IF NOT EXISTS web_sessions_expires_idx ON web_sessions(expires);
+  `);
+
+  const userColumns = db.prepare('PRAGMA table_info(users)').all();
+  if (!userColumns.some((column) => column.name === 'is_suspended')) {
+    db.exec('ALTER TABLE users ADD COLUMN is_suspended INTEGER NOT NULL DEFAULT 0');
+  }
+  const sessionColumns = db.prepare('PRAGMA table_info(web_sessions)').all();
+  if (!sessionColumns.some((column) => column.name === 'user_id')) {
+    db.exec('ALTER TABLE web_sessions ADD COLUMN user_id INTEGER');
+  }
+
+  const adminEmail = (process.env.ADMIN_EMAIL || 'admin@receitasdetodos.com').trim().toLowerCase();
+  const adminPassword = process.env.ADMIN_PASSWORD || 'admin123';
+  const existingAdmin = db.prepare('SELECT id FROM users WHERE email = ?').get(adminEmail);
+  if (!existingAdmin) {
+    const adminHash = bcrypt.hashSync(adminPassword, 10);
+    const inserted = db.prepare(`
+      INSERT INTO users (name, email, password_hash, bio, avatar_url, is_admin)
+      VALUES (?, ?, ?, ?, ?, 1)
+    `).run('Admin Receitas', adminEmail, adminHash, 'Moderador da comunidade de culinária.', '/images/default-avatar.svg');
+
+    const recipesSeed = [
+      {
+        user_id: inserted.lastInsertRowid,
+        title: 'Risoto de cogumelos cremoso',
+        category: 'massas',
+        description: 'Uma refeição reconfortante com molho cremoso, cogumelos e queijo parmesão.',
+        photo_url: 'https://images.unsplash.com/photo-1517248135467-4c7edcad34c4?auto=format&fit=crop&w=900&q=80',
+        ingredients: ['400g de arroz arbóreo', '250g de cogumelos', '1 xícara de vinho branco', '1 litro de caldo de legumes', '1/2 xícara de parmesão ralado', '2 colheres de manteiga', '1 cebola pequena'],
+        steps: ['Refogue a cebola e os cogumelos.', 'Adicione o arroz e mexa até ficar translúcido.', 'Vá acrescentando o caldo aos poucos.', 'Quando o arroz estiver cremoso, misture o parmesão e a manteiga.', 'Sirva em seguida.'],
+        prep_time: '40 minutos',
+        servings: '2 a 3 pessoas',
+        difficulty: 'média'
+      },
+      {
+        user_id: inserted.lastInsertRowid,
+        title: 'Bolo de cenoura fofo',
+        category: 'bolos',
+        description: 'Bolo clássico com cobertura cremosa e textura leve.',
+        photo_url: 'https://images.unsplash.com/photo-1556910103-1c02745aae4d?auto=format&fit=crop&w=900&q=80',
+        ingredients: ['3 cenouras médias', '3 ovos', '1 xícara de óleo', '2 xícaras de açúcar', '2 xícaras de farinha de trigo', '1 colher de fermento em pó'],
+        steps: ['Bata cenoura, ovos e óleo no liquidificador.', 'Misture com açúcar, farinha e fermento.', 'Asse em forno preaquecido por 35 minutos.', 'Deixe esfriar e cubra com chocolate ou brigadeiro.'],
+        prep_time: '50 minutos',
+        servings: '8 fatias',
+        difficulty: 'fácil'
+      },
+      {
+        user_id: inserted.lastInsertRowid,
+        title: 'Salada de quinoa tropical',
+        category: 'saladas',
+        description: 'Leve, nutritiva e cheia de sabor para o dia a dia.',
+        photo_url: 'https://images.unsplash.com/photo-1546793665-c74683f339c1?auto=format&fit=crop&w=900&q=80',
+        ingredients: ['1 xícara de quinoa cozida', '1 manga picada', '1/2 abacaxi em cubos', '1/2 xícara de folhas de rúcula', '1/2 abacate', 'Suco de 1 limão'],
+        steps: ['Misture a quinoa com a manga e o abacaxi.', 'Adicione a rúcula e o abacate', 'Tempere com limão, sal e azeite.', 'Sirva imediatamente.'],
+        prep_time: '20 minutos',
+        servings: '2 porções',
+        difficulty: 'fácil'
+      }
+    ];
+
+    for (const recipe of recipesSeed) {
+      db.prepare(`
+        INSERT INTO recipes (user_id, title, category, description, photo_url, ingredients_json, steps_json, prep_time, servings, difficulty)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        recipe.user_id,
+        recipe.title,
+        recipe.category,
+        recipe.description,
+        recipe.photo_url,
+        JSON.stringify(recipe.ingredients),
+        JSON.stringify(recipe.steps),
+        recipe.prep_time,
+        recipe.servings,
+        recipe.difficulty
+      );
+    }
+  } else if (process.env.ADMIN_PASSWORD) {
+    const adminHash = bcrypt.hashSync(adminPassword, 10);
+    db.prepare('UPDATE users SET password_hash = ?, is_admin = 1 WHERE id = ?').run(adminHash, existingAdmin.id);
+  }
+
+  if (isProduction && adminEmail !== 'admin@receitasdetodos.com') {
+    db.prepare('UPDATE users SET is_admin = 0 WHERE email = ?').run('admin@receitasdetodos.com');
+  }
+}
+
+initializeDatabase();
+db.pragma('journal_mode = WAL');
+
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+app.use('/uploads', express.static(uploadDir, { dotfiles: 'deny', index: false }));
+app.use(express.static(path.join(__dirname, 'public')));
+if (isProduction) app.set('trust proxy', 1);
+const sessionStore = new SqliteSessionStore(db);
+const cleanupSessions = setInterval(() => {
+  sessionStore.deleteExpired.run(Date.now());
+}, 60 * 60 * 1000);
+cleanupSessions.unref();
+app.use(session({
+  secret: process.env.SESSION_SECRET || 'receitas-de-todos-secret',
+  store: sessionStore,
+  resave: false,
+  saveUninitialized: false,
+  unset: 'destroy',
+  cookie: { maxAge: 1000 * 60 * 60 * 8, httpOnly: true, sameSite: 'lax', secure: isProduction }
+}));
+
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
+
+app.use((req, res, next) => {
+  res.locals.currentUser = req.session.user || null;
+  res.locals.categories = CATEGORIES;
+  res.locals.formatDate = formatDate;
+  res.locals.prepTimeMinutes = getPrepTimeMinutes;
+  res.locals.flash = req.session.flash || null;
+  res.locals.pageTitle = res.locals.pageTitle || 'Receitas de Todos';
+  res.locals.metaDescription = res.locals.metaDescription || 'Receitas de Todos — uma comunidade de culinária para compartilhar receitas e descobrir pratos novos.';
+  delete req.session.flash;
+  next();
+});
+
+function requireAuth(req, res, next) {
+  if (!req.session.user) {
+    setFlash(req, 'Faça login para continuar.', 'warning');
+    return res.redirect('/login');
+  }
+  const user = db.prepare('SELECT is_suspended FROM users WHERE id = ?').get(req.session.user.id);
+  if (!user || user.is_suspended) {
+    req.session.user = null;
+    setFlash(req, 'Esta conta não está disponível. Se precisar de ajuda, fale com a administração.', 'danger');
+    return res.redirect('/login');
+  }
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  const user = req.session.user
+    ? db.prepare('SELECT is_admin, is_suspended FROM users WHERE id = ?').get(req.session.user.id)
+    : null;
+  if (!user || !user.is_admin || user.is_suspended) {
+    if (req.session.user) req.session.user.is_admin = false;
+    setFlash(req, 'Você não tem permissão para acessar esta área.', 'danger');
+    return res.redirect('/');
+  }
+  req.session.user.is_admin = true;
+  next();
+}
+
+function establishSession(req, res, user, message, redirectTo, next) {
+  req.session.regenerate((error) => {
+    if (error) return next(error);
+    req.session.user = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      bio: user.bio,
+      avatar_url: user.avatar_url,
+      is_admin: !!user.is_admin
+    };
+    setFlash(req, message, 'success');
+    req.session.save((saveError) => {
+      if (saveError) return next(saveError);
+      res.redirect(redirectTo);
+    });
+  });
+}
+
+function renderHomePage(res, extra = {}) {
+  const recentRecipes = getRecipeSummary({ limit: 6 });
+  const popularRecipes = getRecipeSummary({ sort: 'popular', limit: 6 });
+  const featuredRecipes = getRecipeSummary({ sort: 'rating', limit: 3 });
+
+  res.render('home', {
+    recentRecipes,
+    popularRecipes,
+    featuredRecipes,
+    ...extra
+  });
+}
+
+app.get('/', (req, res) => {
+  renderHomePage(res);
+});
+
+app.get('/recipes', (req, res) => {
+  const search = typeof req.query.q === 'string' ? req.query.q.trim() : '';
+  const category = typeof req.query.category === 'string' ? req.query.category.trim() : '';
+  const difficulty = typeof req.query.difficulty === 'string' ? req.query.difficulty.trim() : '';
+  const requestedMaxTime = typeof req.query.max_time === 'string' ? Number(req.query.max_time) : 0;
+  const maxPrepTime = [15, 30, 45, 60, 90, 120].includes(requestedMaxTime) ? requestedMaxTime : 0;
+  const sort = typeof req.query.sort === 'string' ? req.query.sort : 'newest';
+  const recipes = getRecipeSummary({ search, category, difficulty, maxPrepTime, sort, limit: 24 });
+
+  res.render('recipes', {
+    recipes,
+    search,
+    category,
+    difficulty,
+    maxPrepTime,
+    sort,
+    selectedCategory: category,
+    pageTitle: 'Receitas'
+  });
+});
+
+app.get('/recipe/:id', (req, res) => {
+  const recipe = getRecipeDetail(req.params.id);
+  if (!recipe) {
+    setFlash(req, 'Receita não encontrada.', 'warning');
+    return res.redirect('/recipes');
+  }
+
+  const ingredients = safeJsonArray(recipe.ingredients_json);
+  const steps = safeJsonArray(recipe.steps_json);
+  const comments = db.prepare(`
+    SELECT c.*, u.name AS author_name, u.avatar_url AS author_avatar
+    FROM comments c
+    JOIN users u ON u.id = c.user_id
+    WHERE c.recipe_id = ?
+    ORDER BY c.created_at DESC
+  `).all(recipe.id);
+  const topLevelComments = comments
+    .filter((comment) => !comment.parent_id)
+    .map((comment) => ({
+      ...comment,
+      replies: comments.filter((reply) => reply.parent_id === comment.id)
+    }));
+
+  const hasLiked = req.session.user
+    ? db.prepare('SELECT 1 FROM likes WHERE recipe_id = ? AND user_id = ?').get(recipe.id, req.session.user.id)
+    : null;
+
+  const hasFavorited = req.session.user
+    ? db.prepare('SELECT 1 FROM favorites WHERE recipe_id = ? AND user_id = ?').get(recipe.id, req.session.user.id)
+    : null;
+
+  const userRating = req.session.user
+    ? db.prepare('SELECT score FROM ratings WHERE recipe_id = ? AND user_id = ?').get(recipe.id, req.session.user.id)
+    : null;
+
+  const isOwner = req.session.user && req.session.user.id === recipe.user_id;
+
+  res.render('recipe-detail', {
+    recipe,
+    ingredients,
+    steps,
+    comments: topLevelComments,
+    hasLiked,
+    hasFavorited,
+    userRating: userRating ? userRating.score : 0,
+    isOwner,
+    pageTitle: `${recipe.title} | Receitas de Todos`,
+    metaDescription: recipe.description.slice(0, 155)
+  });
+});
+
+app.get('/recipe/:id/edit', requireAuth, (req, res) => {
+  const recipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
+  if (!recipe) {
+    return res.redirect('/recipes');
+  }
+  if (recipe.user_id !== req.session.user.id && !req.session.user.is_admin) {
+    setFlash(req, 'Você não pode editar esta receita.', 'danger');
+    return res.redirect(`/recipe/${recipe.id}`);
+  }
+
+  const ingredients = safeJsonArray(recipe.ingredients_json).join('\n');
+  const steps = safeJsonArray(recipe.steps_json).join('\n');
+
+  res.render('recipe-form', {
+    mode: 'edit',
+    recipe: { ...recipe, ingredients, steps },
+    pageTitle: 'Editar receita'
+  });
+});
+
+app.post('/recipe/:id/edit', requireAuth, upload.single('photo'), verifyUploadedImage, (req, res) => {
+  const recipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
+  if (!recipe) {
+    return res.redirect('/recipes');
+  }
+  if (recipe.user_id !== req.session.user.id && !req.session.user.is_admin) {
+    setFlash(req, 'Você não pode editar esta receita.', 'danger');
+    return res.redirect(`/recipe/${recipe.id}`);
+  }
+
+  const parsed = parseRecipeForm(req.body);
+  if (parsed.error) {
+    if (req.file) fs.unlinkSync(req.file.path);
+    setFlash(req, parsed.error, 'warning');
+    return res.redirect(`/recipe/${recipe.id}/edit`);
+  }
+
+  const fields = parsed.value;
+  const photoUrl = req.file ? `/uploads/${req.file.filename}` : (fields.photoUrl || recipe.photo_url || '');
+
+  db.prepare(`
+    UPDATE recipes
+    SET title = ?, category = ?, description = ?, photo_url = ?, ingredients_json = ?, steps_json = ?, prep_time = ?, servings = ?, difficulty = ?
+    WHERE id = ?
+  `).run(fields.title, fields.category, fields.description, photoUrl, fields.ingredients, fields.steps, fields.prepTime, fields.servings, fields.difficulty, recipe.id);
+
+  setFlash(req, 'Receita atualizada com sucesso!', 'success');
+  res.redirect(`/recipe/${recipe.id}`);
+});
+
+app.post('/recipe/:id/delete', requireAuth, (req, res) => {
+  const recipe = db.prepare('SELECT * FROM recipes WHERE id = ?').get(req.params.id);
+  if (!recipe) {
+    return res.redirect('/recipes');
+  }
+  if (recipe.user_id !== req.session.user.id && !req.session.user.is_admin) {
+    setFlash(req, 'Você não pode remover esta receita.', 'danger');
+    return res.redirect(`/recipe/${recipe.id}`);
+  }
+
+  removeRecipe(recipe.id);
+
+  setFlash(req, 'Receita removida com sucesso.', 'success');
+  return res.redirect('/profile');
+});
+
+app.post('/recipe/:id/like', requireAuth, (req, res) => {
+  const recipeId = Number(req.params.id);
+  const existing = db.prepare('SELECT id FROM likes WHERE recipe_id = ? AND user_id = ?').get(recipeId, req.session.user.id);
+
+  if (existing) {
+    db.prepare('DELETE FROM likes WHERE id = ?').run(existing.id);
+  } else {
+    db.prepare('INSERT INTO likes (recipe_id, user_id) VALUES (?, ?)').run(recipeId, req.session.user.id);
+  }
+
+  res.redirect(`/recipe/${recipeId}`);
+});
+
+app.post('/recipe/:id/favorite', requireAuth, (req, res) => {
+  const recipeId = Number(req.params.id);
+  const existing = db.prepare('SELECT id FROM favorites WHERE recipe_id = ? AND user_id = ?').get(recipeId, req.session.user.id);
+
+  if (existing) {
+    db.prepare('DELETE FROM favorites WHERE id = ?').run(existing.id);
+  } else {
+    db.prepare('INSERT INTO favorites (recipe_id, user_id) VALUES (?, ?)').run(recipeId, req.session.user.id);
+  }
+
+  res.redirect(`/recipe/${recipeId}`);
+});
+
+app.post('/recipe/:id/rate', requireAuth, (req, res) => {
+  const recipeId = Number(req.params.id);
+  const score = Number(req.body.score || 0);
+
+  if (!Number.isInteger(score) || score < 1 || score > 5) {
+    setFlash(req, 'Selecione uma avaliação válida.', 'warning');
+    return res.redirect(`/recipe/${recipeId}`);
+  }
+
+  const existing = db.prepare('SELECT id FROM ratings WHERE recipe_id = ? AND user_id = ?').get(recipeId, req.session.user.id);
+  if (existing) {
+    db.prepare('UPDATE ratings SET score = ? WHERE id = ?').run(score, existing.id);
+  } else {
+    db.prepare('INSERT INTO ratings (recipe_id, user_id, score) VALUES (?, ?, ?)').run(recipeId, req.session.user.id, score);
+  }
+
+  setFlash(req, 'Sua avaliação foi registrada.', 'success');
+  res.redirect(`/recipe/${recipeId}`);
+});
+
+app.post('/recipe/:id/comment', requireAuth, (req, res) => {
+  const recipeId = Number(req.params.id);
+  const body = typeof req.body.body === 'string' ? req.body.body.trim() : '';
+  const parentId = req.body.parent_id ? Number(req.body.parent_id) : null;
+
+  if (!body || body.length > 1000) {
+    setFlash(req, 'O comentário deve ter entre 1 e 1000 caracteres.', 'warning');
+    return res.redirect(`/recipe/${recipeId}`);
+  }
+
+  if (!db.prepare('SELECT id FROM recipes WHERE id = ?').get(recipeId)) {
+    setFlash(req, 'Receita não encontrada.', 'warning');
+    return res.redirect('/recipes');
+  }
+
+  if (parentId) {
+    const parent = db.prepare('SELECT id FROM comments WHERE id = ? AND recipe_id = ? AND parent_id IS NULL').get(parentId, recipeId);
+    if (!parent) {
+      setFlash(req, 'Não foi possível responder a esse comentário.', 'warning');
+      return res.redirect(`/recipe/${recipeId}`);
+    }
+  }
+
+  db.prepare('INSERT INTO comments (recipe_id, user_id, parent_id, body) VALUES (?, ?, ?, ?)').run(recipeId, req.session.user.id, parentId, body);
+  setFlash(req, 'Comentário enviado.', 'success');
+  res.redirect(`/recipe/${recipeId}`);
+});
+
+app.post('/recipe/:id/report', requireAuth, (req, res) => {
+  const recipeId = Number(req.params.id);
+  const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
+
+  if (!db.prepare('SELECT id FROM recipes WHERE id = ?').get(recipeId)) {
+    setFlash(req, 'Receita não encontrada.', 'warning');
+    return res.redirect('/recipes');
+  }
+  if (!reason || reason.length > 500) {
+    setFlash(req, 'Informe um motivo com até 500 caracteres.', 'warning');
+    return res.redirect(`/recipe/${recipeId}`);
+  }
+
+  const duplicate = db.prepare("SELECT id FROM reports WHERE type = 'recipe' AND item_id = ? AND user_id = ? AND status = 'open'").get(recipeId, req.session.user.id);
+  if (!duplicate) db.prepare('INSERT INTO reports (type, item_id, user_id, reason) VALUES (?, ?, ?, ?)').run('recipe', recipeId, req.session.user.id, reason);
+  setFlash(req, 'Denúncia registrada. A equipe de moderação será avisada.', 'success');
+  res.redirect(`/recipe/${recipeId}`);
+});
+
+app.post('/comment/:id/report', requireAuth, (req, res) => {
+  const commentId = Number(req.params.id);
+  const comment = db.prepare('SELECT id, recipe_id FROM comments WHERE id = ?').get(commentId);
+  if (!comment) {
+    setFlash(req, 'Comentário não encontrado.', 'warning');
+    return res.redirect('/recipes');
+  }
+
+  const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
+  if (!reason || reason.length > 500) {
+    setFlash(req, 'Informe um motivo com até 500 caracteres.', 'warning');
+    return res.redirect(`/recipe/${comment.recipe_id}`);
+  }
+
+  const duplicate = db.prepare("SELECT id FROM reports WHERE type = 'comment' AND item_id = ? AND user_id = ? AND status = 'open'").get(commentId, req.session.user.id);
+  if (!duplicate) db.prepare('INSERT INTO reports (type, item_id, user_id, reason) VALUES (?, ?, ?, ?)').run('comment', commentId, req.session.user.id, reason);
+  setFlash(req, 'Denúncia registrada para análise da moderação.', 'success');
+  res.redirect(`/recipe/${comment.recipe_id}`);
+});
+
+app.get('/login', (req, res) => {
+  if (req.session.user) return res.redirect('/profile');
+  res.render('login', { pageTitle: 'Login' });
+});
+
+app.post('/login', (req, res) => {
+  const email = (req.body.email || '').trim().toLowerCase();
+  const password = req.body.password || '';
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+
+  if (!user || user.is_suspended || !bcrypt.compareSync(password, user.password_hash)) {
+    setFlash(req, 'E-mail ou senha inválidos.', 'danger');
+    return res.redirect('/login');
+  }
+
+  establishSession(req, res, user, `Bem-vindo(a), ${user.name}!`, '/', (error) => {
+    console.error('Não foi possível iniciar a sessão do usuário.', error);
+    res.status(500).send('Não foi possível iniciar sua sessão. Tente novamente.');
+  });
+});
+
+app.get('/register', (req, res) => {
+  if (req.session.user) return res.redirect('/profile');
+  res.render('register', { pageTitle: 'Cadastro' });
+});
+
+app.post('/register', (req, res) => {
+  const name = (req.body.name || '').trim();
+  const email = (req.body.email || '').trim().toLowerCase();
+  const password = req.body.password || '';
+
+  if (!name || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || password.length < 10) {
+    setFlash(req, 'Informe nome e e-mail válidos. A senha deve ter pelo menos 10 caracteres.', 'warning');
+    return res.redirect('/register');
+  }
+
+  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
+  if (existing) {
+    setFlash(req, 'Esse e-mail já está cadastrado.', 'danger');
+    return res.redirect('/register');
+  }
+
+  const passwordHash = bcrypt.hashSync(password, 10);
+  const result = db.prepare('INSERT INTO users (name, email, password_hash, avatar_url) VALUES (?, ?, ?, ?)').run(name, email, passwordHash, '/images/default-avatar.svg');
+  const user = {
+    id: Number(result.lastInsertRowid),
+    name,
+    email,
+    bio: '',
+    avatar_url: '/images/default-avatar.svg',
+    is_admin: false
+  };
+
+  establishSession(req, res, user, 'Cadastro realizado com sucesso!', '/', (error) => {
+    console.error('Não foi possível iniciar a sessão após o cadastro.', error);
+    res.status(500).send('Sua conta foi criada, mas não foi possível iniciar a sessão. Entre pela página de login.');
+  });
+});
+
+app.post('/logout', (req, res, next) => {
+  req.session.destroy((error) => {
+    if (error) return next(error);
+    res.redirect('/');
+  });
+});
+
+app.get('/recover', (req, res) => {
+  res.render('recover', { pageTitle: 'Recuperar senha' });
+});
+
+app.post('/recover', async (req, res) => {
+  const email = (req.body.email || '').trim().toLowerCase();
+  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
+  const genericMessage = 'Se a conta existir, enviaremos instruções para o e-mail cadastrado.';
+
+  if (!mailer) {
+    setFlash(req, 'A recuperação de senha está temporariamente indisponível porque o serviço de e-mail não está configurado.', 'warning');
+    return res.redirect('/recover');
+  }
+
+  if (user) {
+    const token = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    const baseUrl = (process.env.APP_BASE_URL || `${req.protocol}://${req.get('host')}`).replace(/\/+$/, '');
+    db.prepare('DELETE FROM password_resets WHERE user_id = ?').run(user.id);
+    db.prepare('INSERT INTO password_resets (user_id, token, expires_at) VALUES (?, ?, ?)').run(user.id, tokenHash, expiresAt);
+
+    try {
+      await mailer.sendMail({
+        from: smtpFrom,
+        to: user.email,
+        subject: 'Redefinição da senha — Receitas de Todos',
+        text: `Use este link para redefinir sua senha (válido por 1 hora): ${baseUrl}/reset/${token}`
+      });
+    } catch (error) {
+      db.prepare('DELETE FROM password_resets WHERE token = ?').run(tokenHash);
+      console.error('Falha ao enviar e-mail de recuperação de senha.', error);
+      setFlash(req, 'Não foi possível enviar o e-mail de recuperação. Tente novamente mais tarde.', 'danger');
+      return res.redirect('/recover');
+    }
+  }
+
+  setFlash(req, genericMessage, 'info');
+  res.redirect('/recover');
+});
+
+app.get('/reset/:token', (req, res) => {
+  const tokenHash = crypto.createHash('sha256').update(req.params.token).digest('hex');
+  const reset = db.prepare("SELECT * FROM password_resets WHERE token = ? AND julianday(expires_at) > julianday('now')").get(tokenHash);
+  if (!reset) {
+    setFlash(req, 'Token inválido ou expirado.', 'danger');
+    return res.redirect('/recover');
+  }
+
+  res.render('reset-password', { token: req.params.token, pageTitle: 'Redefinir senha' });
+});
+
+app.post('/reset/:token', (req, res) => {
+  const tokenHash = crypto.createHash('sha256').update(req.params.token).digest('hex');
+  const reset = db.prepare("SELECT * FROM password_resets WHERE token = ? AND julianday(expires_at) > julianday('now')").get(tokenHash);
+  if (!reset) {
+    setFlash(req, 'Token inválido ou expirado.', 'danger');
+    return res.redirect('/recover');
+  }
+
+  const password = req.body.password || '';
+  if (password.length < 10) {
+    setFlash(req, 'A nova senha deve ter pelo menos 10 caracteres.', 'warning');
+    return res.redirect(`/reset/${req.params.token}`);
+  }
+
+  const passwordHash = bcrypt.hashSync(password, 10);
+  db.transaction(() => {
+    db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(passwordHash, reset.user_id);
+    db.prepare('DELETE FROM password_resets WHERE user_id = ?').run(reset.user_id);
+  })();
+
+  setFlash(req, 'Senha redefinida com sucesso!', 'success');
+  res.redirect('/login');
+});
+
+app.get('/profile', requireAuth, (req, res) => {
+  const userData = getUserSummary(req.session.user.id);
+  const recipes = db.prepare(`
+    SELECT r.*, (SELECT COUNT(*) FROM likes WHERE recipe_id = r.id) AS likes_count,
+           COALESCE((SELECT AVG(score) FROM ratings WHERE recipe_id = r.id), 0) AS average_rating
+    FROM recipes r
+    WHERE r.user_id = ?
+    ORDER BY r.created_at DESC
+  `).all(req.session.user.id);
+
+  const favorites = db.prepare(`
+    SELECT r.*, u.name AS author_name,
+           (SELECT COUNT(*) FROM likes WHERE recipe_id = r.id) AS likes_count,
+           COALESCE((SELECT AVG(score) FROM ratings WHERE recipe_id = r.id), 0) AS average_rating
+    FROM favorites f
+    JOIN recipes r ON r.id = f.recipe_id
+    JOIN users u ON u.id = r.user_id
+    WHERE f.user_id = ?
+    ORDER BY f.created_at DESC
+  `).all(req.session.user.id);
+
+  res.render('profile', { userData, recipes, favorites, isOwnProfile: true, pageTitle: 'Meu perfil', metaDescription: `Perfil de ${userData.name} na comunidade Receitas de Todos.` });
+});
+
+app.get('/profile/edit', requireAuth, (req, res) => {
+  const userData = getUserSummary(req.session.user.id);
+  res.render('profile-edit', { userData, pageTitle: 'Editar perfil' });
+});
+
+app.post('/profile/edit', requireAuth, upload.single('avatar'), verifyUploadedImage, (req, res, next) => {
+  const name = typeof req.body.name === 'string' ? req.body.name.trim() : '';
+  const bio = typeof req.body.bio === 'string' ? req.body.bio.trim() : '';
+  const avatarUrl = typeof req.body.avatar_url === 'string' ? req.body.avatar_url.trim() : '';
+
+  if (name.length < 2 || name.length > 80 || bio.length > 500 ||
+      avatarUrl.length > 2000 || !isSafeImageUrl(avatarUrl)) {
+    if (req.file) fs.unlinkSync(req.file.path);
+    setFlash(req, 'Confira o nome, a biografia e a URL da foto.', 'warning');
+    return res.redirect('/profile/edit');
+  }
+
+  const nextAvatar = req.file ? `/uploads/${req.file.filename}` : (avatarUrl || req.session.user.avatar_url || '/images/default-avatar.svg');
+  db.prepare('UPDATE users SET name = ?, bio = ?, avatar_url = ? WHERE id = ?')
+    .run(name, bio, nextAvatar, req.session.user.id);
+  req.session.user.name = name;
+  req.session.user.bio = bio;
+  req.session.user.avatar_url = nextAvatar;
+  setFlash(req, 'Perfil atualizado.', 'success');
+  req.session.save((error) => {
+    if (error) return next(error);
+    res.redirect('/profile');
+  });
+});
+
+app.get('/profile/:id', (req, res) => {
+  const userData = getUserSummary(req.params.id);
+  if (!userData) {
+    setFlash(req, 'Perfil não encontrado.', 'warning');
+    return res.redirect('/recipes');
+  }
+
+  const recipes = db.prepare(`
+    SELECT r.*, (SELECT COUNT(*) FROM likes WHERE recipe_id = r.id) AS likes_count,
+           COALESCE((SELECT AVG(score) FROM ratings WHERE recipe_id = r.id), 0) AS average_rating
+    FROM recipes r
+    WHERE r.user_id = ?
+    ORDER BY r.created_at DESC
+  `).all(userData.id);
+
+  const canViewFavorites = req.session.user && req.session.user.id === userData.id;
+  const favorites = canViewFavorites ? db.prepare(`
+    SELECT r.*, u.name AS author_name,
+           (SELECT COUNT(*) FROM likes WHERE recipe_id = r.id) AS likes_count,
+           COALESCE((SELECT AVG(score) FROM ratings WHERE recipe_id = r.id), 0) AS average_rating
+    FROM favorites f
+    JOIN recipes r ON r.id = f.recipe_id
+    JOIN users u ON u.id = r.user_id
+    WHERE f.user_id = ?
+    ORDER BY f.created_at DESC
+  `).all(userData.id) : [];
+
+  res.render('profile', { userData, recipes, favorites, isOwnProfile: canViewFavorites, pageTitle: `${userData.name} | Perfil`, metaDescription: `Receitas publicadas por ${userData.name} na comunidade Receitas de Todos.` });
+});
+
+app.get('/new-recipe', requireAuth, (req, res) => {
+  res.render('recipe-form', { mode: 'create', recipe: null, pageTitle: 'Nova receita' });
+});
+
+app.post('/new-recipe', requireAuth, upload.single('photo'), verifyUploadedImage, (req, res) => {
+  const parsed = parseRecipeForm(req.body);
+  if (parsed.error) {
+    if (req.file) fs.unlinkSync(req.file.path);
+    setFlash(req, parsed.error, 'warning');
+    return res.redirect('/new-recipe');
+  }
+
+  const fields = parsed.value;
+  const photoUrl = req.file ? `/uploads/${req.file.filename}` : (fields.photoUrl || 'https://images.unsplash.com/photo-1547592180-85f173990554?auto=format&fit=crop&w=900&q=80');
+
+  const result = db.prepare(`
+    INSERT INTO recipes (user_id, title, category, description, photo_url, ingredients_json, steps_json, prep_time, servings, difficulty)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(req.session.user.id, fields.title, fields.category, fields.description, photoUrl, fields.ingredients, fields.steps, fields.prepTime, fields.servings, fields.difficulty);
+
+  setFlash(req, 'Receita publicada com sucesso!', 'success');
+  res.redirect(`/recipe/${result.lastInsertRowid}`);
+});
+
+app.get('/admin', requireAdmin, (req, res) => {
+  const reports = db.prepare(`
+    SELECT r.*, u.name AS reporter_name,
+           (CASE WHEN r.type = 'recipe' THEN (SELECT title FROM recipes WHERE id = r.item_id) ELSE (SELECT body FROM comments WHERE id = r.item_id) END) AS item_label
+    FROM reports r
+    JOIN users u ON u.id = r.user_id
+    WHERE r.status = 'open'
+    ORDER BY r.created_at DESC
+  `).all();
+
+  const stats = {
+    users: db.prepare('SELECT COUNT(*) AS total FROM users').get().total,
+    recipes: db.prepare('SELECT COUNT(*) AS total FROM recipes').get().total,
+    reports: db.prepare("SELECT COUNT(*) AS total FROM reports WHERE status = 'open'").get().total,
+    comments: db.prepare('SELECT COUNT(*) AS total FROM comments').get().total
+  };
+
+  const recipes = db.prepare(`
+    SELECT r.id, r.title, r.category, r.photo_url, r.created_at, u.name AS author_name
+    FROM recipes r
+    JOIN users u ON u.id = r.user_id
+    ORDER BY r.created_at DESC
+  `).all();
+  const users = db.prepare(`
+    SELECT u.id, u.name, u.email, u.is_suspended, u.created_at,
+           (SELECT COUNT(*) FROM recipes r WHERE r.user_id = u.id) AS recipes_count
+    FROM users u
+    WHERE u.is_admin = 0
+    ORDER BY u.created_at DESC
+    LIMIT 200
+  `).all();
+
+  res.render('admin', { reports, recipes, users, stats, pageTitle: 'Administração' });
+});
+
+app.post('/admin/resolve/:id', requireAdmin, (req, res) => {
+  db.prepare('UPDATE reports SET status = ? WHERE id = ?').run('resolved', req.params.id);
+  setFlash(req, 'Denúncia resolvida.', 'success');
+  res.redirect('/admin');
+});
+
+app.post('/admin/comment/:id/delete', requireAdmin, (req, res) => {
+  const comment = db.prepare('SELECT id FROM comments WHERE id = ?').get(req.params.id);
+  if (comment) {
+    db.transaction(() => {
+      db.prepare("DELETE FROM reports WHERE type = 'comment' AND item_id IN (SELECT id FROM comments WHERE id = ? OR parent_id = ?)").run(comment.id, comment.id);
+      db.prepare('DELETE FROM comments WHERE parent_id = ?').run(comment.id);
+      db.prepare('DELETE FROM comments WHERE id = ?').run(comment.id);
+    })();
+  }
+  setFlash(req, 'Comentário removido pela moderação.', 'success');
+  res.redirect('/admin');
+});
+
+app.post('/admin/user/:id/toggle-suspension', requireAdmin, (req, res) => {
+  const target = db.prepare('SELECT id, is_admin, is_suspended FROM users WHERE id = ?').get(req.params.id);
+  if (!target || target.is_admin || target.id === req.session.user.id) {
+    setFlash(req, 'Essa conta não pode ser moderada por esta ação.', 'warning');
+    return res.redirect('/admin');
+  }
+
+  const nextSuspendedState = target.is_suspended ? 0 : 1;
+  db.prepare('UPDATE users SET is_suspended = ? WHERE id = ?').run(nextSuspendedState, target.id);
+  if (nextSuspendedState) sessionStore.deleteUserSessions.run(target.id);
+  setFlash(req, nextSuspendedState ? 'Conta suspensa.' : 'Conta reativada.', 'success');
+  res.redirect('/admin');
+});
+
+app.post('/admin/recipe/:id/delete', requireAdmin, (req, res) => {
+  removeRecipe(req.params.id);
+  setFlash(req, 'Receita removida pela moderação.', 'success');
+  res.redirect('/admin');
+});
+
+app.get('/about', (req, res) => {
+  res.render('static-page', { pageTitle: 'Sobre', content: `A Receitas de Todos nasceu para conectar cozinheiros, compartilhar experiências e criar uma comunidade vibrante de culinária caseira.` });
+});
+
+app.get('/contact', (req, res) => {
+  res.render('static-page', { pageTitle: 'Contato', content: 'Entre em contato através do e-mail contato@receitasdetodos.com ou pela área administrativa do projeto.' });
+});
+
+app.get('/privacy', (req, res) => {
+  res.render('static-page', { pageTitle: 'Política de Privacidade', content: 'Os dados dos usuários são usados apenas para operação da plataforma, autenticação, segurança e melhoria do serviço.' });
+});
+
+app.get('/terms', (req, res) => {
+  res.render('static-page', { pageTitle: 'Termos de Uso', content: 'O uso da plataforma deve respeitar regras de convivência, segurança e direitos autorais. Qualquer conteúdo impróprio pode ser removido.' });
+});
+
+app.use((err, req, res, next) => {
+  if (!(err instanceof multer.MulterError) &&
+      err.message !== 'Formato de imagem não suportado. Envie JPG, PNG, WEBP ou GIF.' &&
+      err.message !== 'O arquivo enviado não parece ser uma imagem válida.') {
+    return next(err);
+  }
+
+  if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
+    setFlash(req, 'A imagem deve ter no máximo 5 MB.', 'warning');
+  } else {
+    setFlash(req, err.message, 'warning');
+  }
+
+  const editPath = req.path.match(/^\/recipe\/(\d+)\/edit$/);
+  if (editPath) return res.redirect(`/recipe/${editPath[1]}/edit`);
+  return res.redirect(req.path === '/profile/edit' ? '/profile/edit' : '/new-recipe');
+});
+
+app.use((error, req, res, next) => {
+  console.error('Erro não tratado durante uma requisição.', error);
+  if (res.headersSent) return next(error);
+  res.status(500).send('Ocorreu um erro interno. Tente novamente mais tarde.');
+});
+
+app.use((req, res) => {
+  res.status(404).render('not-found', { pageTitle: 'Página não encontrada' });
+});
+
+app.listen(PORT, () => {
+  console.log(`Receitas de Todos rodando em http://localhost:${PORT}`);
+});
